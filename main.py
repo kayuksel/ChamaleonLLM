@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
-import pickle as cPickle  # Using pickle with the highest protocol.
+import pickle as cPickle
 import csv
 import math
 
@@ -249,6 +249,7 @@ class LoRALinearDefault(nn.Module):
         lora_update = F.linear(lora_update, self.B)
         return original + self.alpha * lora_update
 
+
 class LoRALinearHyper(nn.Module):
     """
     A LoRA wrapper for an nn.Linear layer that uses a hyper‑network to predict
@@ -469,30 +470,42 @@ def main():
     total_params = sum(p.numel() for p in lm_model.parameters())
     print(f"Total parameters in unadapted GPT-2: {total_params}")
 
-    # Load training and validation splits.
-    print("Loading and tokenizing training set...")
-    train_ds = load_and_tokenize_dataset(tokenizer, max_length=args.max_length, split="train",
-                                         text_field=args.text_field, dataset_name=args.dataset_name, dataset_config=args.dataset_config)
-    print("Loading and tokenizing validation set...")
-    val_ds = load_and_tokenize_dataset(tokenizer, max_length=args.max_length, split="validation",
-                                       text_field=args.text_field, dataset_name=args.dataset_name, dataset_config=args.dataset_config)
+    # -----------------------------------------------------
+    # If the pickle files for the DataLoaders exist (named using dataset_name),
+    # load them directly. Otherwise, download/process the dataset.
+    # -----------------------------------------------------
+    train_pickle = f"{args.dataset_name}_train_loader.pkl"
+    val_pickle = f"{args.dataset_name}_val_loader.pkl"
+    if os.path.exists(train_pickle) and os.path.exists(val_pickle):
+        print("Pickle files exist. Loading DataLoaders from pickle...")
+        with open(train_pickle, "rb") as f:
+            train_loader = cPickle.load(f)
+        with open(val_pickle, "rb") as f:
+            val_loader = cPickle.load(f)
+    else:
+        print("Loading and tokenizing training set...")
+        train_ds = load_and_tokenize_dataset(tokenizer, max_length=args.max_length, split="train",
+                                             text_field=args.text_field, dataset_name=args.dataset_name, dataset_config=args.dataset_config)
+        print("Loading and tokenizing validation set...")
+        val_ds = load_and_tokenize_dataset(tokenizer, max_length=args.max_length, split="validation",
+                                           text_field=args.text_field, dataset_name=args.dataset_name, dataset_config=args.dataset_config)
     
-    # Precompute embeddings.
-    print("Precomputing LM input embeddings for training set...")
-    train_ds = precompute_lm_input_embeddings(train_ds, lm_model, tokenizer, DEVICE)
-    print("Precomputing LM input embeddings for validation set...")
-    val_ds = precompute_lm_input_embeddings(val_ds, lm_model, tokenizer, DEVICE)
+        # Precompute embeddings.
+        print("Precomputing LM input embeddings for training set...")
+        train_ds = precompute_lm_input_embeddings(train_ds, lm_model, tokenizer, DEVICE)
+        print("Precomputing LM input embeddings for validation set...")
+        val_ds = precompute_lm_input_embeddings(val_ds, lm_model, tokenizer, DEVICE)
     
-    print("Precomputing token embeddings for clustering/hypernetwork (training set)...")
-    train_ds = precompute_token_embeddings(train_ds, lm_model, tokenizer, DEVICE)
-    print("Precomputing token embeddings for clustering/hypernetwork (validation set)...")
-    val_ds = precompute_token_embeddings(val_ds, lm_model, tokenizer, DEVICE)
+        print("Precomputing token embeddings for clustering/hypernetwork (training set)...")
+        train_ds = precompute_token_embeddings(train_ds, lm_model, tokenizer, DEVICE)
+        print("Precomputing token embeddings for clustering/hypernetwork (validation set)...")
+        val_ds = precompute_token_embeddings(val_ds, lm_model, tokenizer, DEVICE)
     
-    # Create clustered DataLoaders.
-    # Here, we pass args.dataset_name so that the saved filename uses it.
-    train_loader = save_or_load_dataloader(train_ds, batch_size=args.batch_size, clustering_field="token_embedding", split_name="train", dataset_name_arg=args.dataset_name)
-    val_loader = save_or_load_dataloader(val_ds, batch_size=args.batch_size, clustering_field="token_embedding", split_name="val", dataset_name_arg=args.dataset_name)
+        # Create clustered DataLoaders.
+        train_loader = save_or_load_dataloader(train_ds, batch_size=args.batch_size, clustering_field="token_embedding", split_name="train", dataset_name_arg=args.dataset_name)
+        val_loader = save_or_load_dataloader(val_ds, batch_size=args.batch_size, clustering_field="token_embedding", split_name="val", dataset_name_arg=args.dataset_name)
 
+    # -----------------------------------------------------
     # Option 1: Use default LoRA for LM head (and default LoRA for all transformer layers).
     print("\n=== Training with Default LoRA (Transformer + LM Head) ===")
     model_default = wrap_lm_with_lora(lm_model, method="default", r=args.rank, alpha=args.alpha)
@@ -504,8 +517,9 @@ def main():
     )
     print(f"Best Validation Loss (Default LoRA): {best_val_loss_default:.4f}")
     
+    # -----------------------------------------------------
     # Option 2: Use hyper‑network LoRA for LM head.
-    encoder_emb_dim = len(train_ds[0]["token_embedding"])
+    encoder_emb_dim = len(train_loader.dataset.dataset[0]["token_embedding"])
     print("\n=== Training with Hyper LoRA (Transformer + LM Head) ===")
     lm_model_hyper = AutoModelForCausalLM.from_pretrained(args.lm_model_name)
     if lm_model_hyper.config.pad_token_id is None:
@@ -528,6 +542,7 @@ def main():
     else:
         print("\nBoth methods achieved the same best validation loss.")
 
+    # -----------------------------------------------------
     # Evaluate the original (unadapted, frozen) GPT-2 on the validation set.
     print("\n=== Evaluating Unadapted (Frozen) GPT-2 ===")
     orig_model = AutoModelForCausalLM.from_pretrained(args.lm_model_name)
