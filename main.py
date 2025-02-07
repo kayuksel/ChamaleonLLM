@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
-import pickle as cPickle
+import pickle as cPickle  # Using pickle with the highest protocol.
 import csv
 import math
 
@@ -49,8 +49,8 @@ def parse_args():
                         help="LoRA rank (default: 4)")
     parser.add_argument("--alpha", type=float, default=1.0,
                         help="Scaling factor for LoRA (default: 1.0)")
-    parser.add_argument("--lr", type=float, default=2e-4,
-                        help="Learning rate for LoRA (default: 2e-4)")
+    parser.add_argument("--lr", type=float, default=5e-4,
+                        help="Learning rate for LoRA (default: 5e-4)")
     args = parser.parse_args()
     return args
 
@@ -380,7 +380,7 @@ def evaluate(model, dataloader, method="default", device=torch.device("cuda" if 
     model.train()
     return avg_loss
 
-def train_lm(model, train_loader, val_loader, method="default", num_epochs=10, learning_rate=2e-4, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), csv_filename="learning_curve.csv"):
+def train_lm(model, train_loader, val_loader, method="default", num_epochs=10, learning_rate=5e-4, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), csv_filename="learning_curve.csv"):
     """
     Train the LM for next-token prediction.
     After each epoch, evaluate on the validation set.
