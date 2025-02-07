@@ -50,8 +50,8 @@ def parse_args():
                         help="Dataset configuration if any (default: None)")
     parser.add_argument("--text_field", type=str, default="text",
                         help="Field name in the dataset containing text (default: 'text')")
-    parser.add_argument("--batch_size", type=int, default=32,
-                        help="Batch size (default: 32)")
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Batch size (default: 16)")
     parser.add_argument("--max_length", type=int, default=512,
                         help="Maximum sequence length for tokenization (default: 512)")
     parser.add_argument("--num_epochs", type=int, default=5,
