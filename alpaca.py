@@ -62,8 +62,8 @@ def parse_args():
                         help="LoRA rank (default: 4)")
     parser.add_argument("--alpha", type=float, default=1.0,
                         help="Scaling factor for LoRA (default: 1.0)")
-    parser.add_argument("--lr", type=float, default=5e-4,
-                        help="Learning rate for LoRA (default: 5e-4)")
+    parser.add_argument("--lr", type=float, default=1e-4,
+                        help="Learning rate for LoRA (default: 1e-4)")
     # Boolean flag: if set, use only the instruction for the task embedding;
     # otherwise, use instruction+input.
     parser.add_argument("--use_task_only_embedding", action="store_true",
@@ -456,7 +456,7 @@ def evaluate(model, dataloader, method="default", device=torch.device("cuda" if 
     model.train()
     return avg_loss
 
-def train_lm(model, train_loader, val_loader, method="default", num_epochs=10, learning_rate=5e-4, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), csv_filename="learning_curve.csv"):
+def train_lm(model, train_loader, val_loader, method="default", num_epochs=10, learning_rate=1e-4, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), csv_filename="learning_curve.csv"):
     model.to(device)
     model.train()
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate)
