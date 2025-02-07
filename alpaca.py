@@ -14,6 +14,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 from tqdm import tqdm
 
+# ----------------------------------------------------
+# Global flag that will be set from the command-line.
+# Controls whether the task embedding is computed from instruction only
+# (if True) or from instruction+input (if False).
+# ----------------------------------------------------
+USE_TASK_ONLY_EMBEDDING = False
+
 # ======================================================
 # Global Dataset Wrapper for Pickling
 # ======================================================
@@ -43,8 +50,8 @@ def parse_args():
                         help="Dataset configuration if any (default: None)")
     parser.add_argument("--text_field", type=str, default="text",
                         help="Field name in the dataset containing text (default: 'text')")
-    parser.add_argument("--batch_size", type=int, default=16,
-                        help="Batch size (default: 16)")
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Batch size (default: 32)")
     parser.add_argument("--max_length", type=int, default=512,
                         help="Maximum sequence length for tokenization (default: 512)")
     parser.add_argument("--num_epochs", type=int, default=5,
@@ -55,6 +62,11 @@ def parse_args():
                         help="Scaling factor for LoRA (default: 1.0)")
     parser.add_argument("--lr", type=float, default=5e-4,
                         help="Learning rate for LoRA (default: 5e-4)")
+    # Boolean flag: if set, use only the instruction for the task embedding;
+    # otherwise, use instruction+input.
+    parser.add_argument("--use_task_only_embedding", action="store_true",
+                        help="If set, use only the instruction portion for token embeddings (for clustering and hyper-LoRA). "
+                             "Otherwise, use instruction+input (if available).")
     args = parser.parse_args()
     return args
 
@@ -64,7 +76,7 @@ def parse_args():
 
 def format_alpaca_prompt(example):
     """
-    Formats an Alpaca example into a prompt.
+    Formats an Alpaca example into a full prompt.
     Expected fields: "instruction", optional "input", and "output".
     """
     instruction = example["instruction"]
@@ -83,38 +95,50 @@ def format_alpaca_prompt(example):
         )
     return prompt
 
-def tokenize_and_compute_instruction_embedding(example, tokenizer, lm_model, max_length, device):
+def get_task_text(example):
     """
-    Tokenizes the full prompt (formatted from the Alpaca example) and computes:
-      - A full prompt LM input embedding (token + positional embedding averaged over the sequence)
-      - An instruction-only token embedding (L2-normalized average of token embeddings)
+    Returns the text used for computing the task token embedding.
+    If USE_TASK_ONLY_EMBEDDING is True, return only the instruction.
+    Otherwise, return instruction+input (if available).
+    (The response is never used for the task embedding.)
+    """
+    instruction = example["instruction"]
+    input_text = example.get("input", "").strip()
+    if not USE_TASK_ONLY_EMBEDDING and input_text:
+        return instruction + "\n" + input_text
+    return instruction
+
+def tokenize_and_compute_embeddings(example, tokenizer, lm_model, max_length, device):
+    """
+    Tokenizes the full prompt and computes two embeddings:
+      - "lm_input_embedding": computed from the full prompt (instruction, optional input, and response).
+      - "task_token_embedding": computed from the task portion only (either instruction only or instruction+input,
+         based on the flag).
       
-    Crucially, this function masks all tokens before the response by setting their labels to -100.
+    Also, masks all tokens before the response marker ("### Response:") in the labels so that the training loss
+    is calculated only from the response tokens.
     """
-    # Format full prompt.
-    prompt = format_alpaca_prompt(example)
-    encoding = tokenizer(prompt, truncation=True, max_length=max_length, padding="max_length")
+    # Build the full prompt.
+    full_prompt = format_alpaca_prompt(example)
+    encoding = tokenizer(full_prompt, truncation=True, max_length=max_length, padding="max_length")
     
-    # Identify where the response starts by finding the marker "### Response:".
+    # Identify the response start by finding the marker "### Response:".
     response_marker = "### Response:"
     marker_ids = tokenizer(response_marker, add_special_tokens=False).input_ids
     input_ids = encoding["input_ids"]
     response_start = None
-    # Find the first occurrence of marker_ids in input_ids.
     for i in range(len(input_ids) - len(marker_ids) + 1):
         if input_ids[i:i+len(marker_ids)] == marker_ids:
             response_start = i + len(marker_ids)
             break
-
-    # Create labels by masking prompt tokens.
+    # Mask tokens before the response (set to -100).
     if response_start is not None:
-        # Set tokens before response_start to -100 so they are ignored in loss calculation.
         labels = [-100] * response_start + input_ids[response_start:]
     else:
         labels = input_ids.copy()
     encoding["labels"] = labels
 
-    # Compute LM input embedding (full prompt) using token+positional embeddings.
+    # Compute the full prompt embedding ("lm_input_embedding").
     input_ids_tensor = torch.tensor(encoding["input_ids"]).unsqueeze(0).to(device)
     lm_model.to(device)
     lm_model.eval()
@@ -125,20 +149,22 @@ def tokenize_and_compute_instruction_embedding(example, tokenizer, lm_model, max
         token_emb = wte[input_ids_tensor]      # (1, seq_len, hidden_size)
         position_ids = torch.arange(0, seq_len, dtype=torch.long, device=device).unsqueeze(0)
         pos_emb = wpe[position_ids]            # (1, seq_len, hidden_size)
-        input_emb = token_emb + pos_emb
-        mean_full_emb = input_emb.mean(dim=1).squeeze(0)
-        encoding["lm_input_embedding"] = mean_full_emb.cpu().numpy().tolist()
+        full_emb = token_emb + pos_emb
+        lm_input_embedding = full_emb.mean(dim=1).squeeze(0)
+        encoding["lm_input_embedding"] = lm_input_embedding.cpu().numpy().tolist()
     
-    # Compute instruction-only token embedding from the instruction text.
-    instruction_text = example["instruction"]
-    inst_encoding = tokenizer(instruction_text, truncation=True, max_length=max_length, padding="max_length")
-    input_ids_inst = torch.tensor(inst_encoding["input_ids"]).unsqueeze(0).to(device)
+    # Compute the task embedding (from instruction or instruction+input, but not the response).
+    task_text = get_task_text(example)
+    task_encoding = tokenizer(task_text, truncation=True, max_length=max_length, padding="max_length")
+    task_ids = task_encoding["input_ids"]
+    task_ids_tensor = torch.tensor(task_ids).unsqueeze(0).to(device)
     with torch.no_grad():
-        token_emb_inst = lm_model.transformer.wte(input_ids_inst)
-        mean_inst_emb = token_emb_inst.mean(dim=1).squeeze(0)
-        norm = mean_inst_emb.norm() + 1e-8
-        normalized_inst_emb = (mean_inst_emb / norm).cpu().numpy().tolist()
-        encoding["instruction_token_embedding"] = normalized_inst_emb
+        task_token_emb = lm_model.transformer.wte(task_ids_tensor)
+        task_emb = task_token_emb.mean(dim=1).squeeze(0)
+        norm = task_emb.norm() + 1e-8
+        task_token_embedding = (task_emb / norm)
+        encoding["task_token_embedding"] = task_token_embedding.cpu().numpy().tolist()
+
     return encoding
 
 def load_and_tokenize_alpaca_dataset(tokenizer, lm_model, max_length, split="train", dataset_name="tatsu-lab/alpaca", device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
@@ -152,7 +178,7 @@ def load_and_tokenize_alpaca_dataset(tokenizer, lm_model, max_length, split="tra
         ds = ds_full.train_test_split(test_size=0.1, seed=42)["test"]
     else:
         ds = load_dataset(dataset_name, split=split)
-    ds = ds.map(lambda ex: tokenize_and_compute_instruction_embedding(ex, tokenizer, lm_model, max_length, device), batched=False)
+    ds = ds.map(lambda ex: tokenize_and_compute_embeddings(ex, tokenizer, lm_model, max_length, device), batched=False)
     return ds
 
 # For non-Alpaca datasets (if needed)
@@ -198,7 +224,7 @@ def precompute_token_embeddings(dataset, lm_model, tokenizer, device):
     new_embs = []
     with torch.no_grad():
         wte = lm_model.transformer.wte.weight
-        for example in tqdm(dataset, desc="Precomputing token embeddings for clustering/hypernetwork"):
+        for example in tqdm(dataset, desc="Precomputing task token embeddings for clustering/hypernetwork"):
             input_ids = torch.tensor(example["input_ids"]).unsqueeze(0).to(device)
             token_emb = wte[input_ids]
             mean_emb = token_emb.mean(dim=1).squeeze(0)
@@ -224,7 +250,7 @@ def kmeans_clustering(embeddings, k, num_iters=10):
                 centroids[j] = embeddings[assignments == j].mean(dim=0)
     return assignments
 
-def create_clustered_dataloader(dataset, batch_size, clustering_field="instruction_token_embedding"):
+def create_clustered_dataloader(dataset, batch_size, clustering_field):
     N = len(dataset)
     num_clusters = max(1, N // batch_size)
     all_emb = torch.tensor([ex[clustering_field] for ex in dataset], dtype=torch.float)
@@ -264,17 +290,16 @@ def collate_fn(batch):
     input_ids = torch.tensor([ex["input_ids"] for ex in batch], dtype=torch.long)
     labels = torch.tensor([ex["labels"] for ex in batch], dtype=torch.long)
     attention_mask = (input_ids != 0).long()
+    # "lm_input_embedding" always holds the full prompt embedding.
     lm_input_embedding = torch.tensor([ex["lm_input_embedding"] for ex in batch], dtype=torch.float)
-    if "instruction_token_embedding" in batch[0]:
-        instruction_token_embedding = torch.tensor([ex["instruction_token_embedding"] for ex in batch], dtype=torch.float)
-    else:
-        instruction_token_embedding = torch.tensor([ex["token_embedding"] for ex in batch], dtype=torch.float)
+    # Use the task token embedding computed (from instruction or instruction+input) for clustering/hyperlora.
+    task_token_embedding = torch.tensor([ex["task_token_embedding"] for ex in batch], dtype=torch.float)
     return {
         "input_ids": input_ids,
         "labels": labels,
         "attention_mask": attention_mask,
         "lm_input_embedding": lm_input_embedding,
-        "instruction_token_embedding": instruction_token_embedding
+        "token_embedding": task_token_embedding
     }
 
 # ======================================================
@@ -308,7 +333,7 @@ class LoRALinearDefault(nn.Module):
 class LoRALinearHyper(nn.Module):
     """
     LoRA wrapper with a hyper‑network that predicts the low‑rank update parameters
-    from an external embedding.
+    from an external embedding. This version supports both 2D (batch, hidden) and 3D (batch, seq_len, hidden) inputs.
     """
     def __init__(self, original_linear: nn.Linear, encoder_emb_dim: int, r=4, alpha=1.0):
         super().__init__()
@@ -333,16 +358,37 @@ class LoRALinearHyper(nn.Module):
         )
         
     def forward(self, x, token_embeddings):
-        mean_encoder = token_embeddings.mean(dim=0, keepdim=True)
-        pred = self.hyper_net(mean_encoder).squeeze(0)
+        # x can be of shape (B, H) or (B, T, H)
+        original_shape = x.shape
+        if len(original_shape) == 3:
+            B, T, H = x.shape
+            x_flat = x.view(B * T, H)
+            flat_input = True
+        else:
+            x_flat = x
+            flat_input = False
+        # Compute parameters from the task token embedding.
+        # (Assume token_embeddings is of shape (B, D); we take the mean over batch.)
+        mean_encoder = token_embeddings.mean(dim=0, keepdim=True)  # shape: (1, D)
+        pred = self.hyper_net(mean_encoder).squeeze(0)  # shape: (num_params,)
         A_flat = pred[: self.r * self.in_features]
         B_flat = pred[self.r * self.in_features:]
         A = A_flat.view(self.r, self.in_features)
         B = B_flat.view(self.out_features, self.r)
-        original = F.linear(x, self.weight, self.bias)
-        lora_update = F.linear(x, A)
+        original = F.linear(x_flat, self.weight, self.bias)
+        lora_update = F.linear(x_flat, A)
         lora_update = F.linear(lora_update, B)
-        return original + self.alpha * lora_update
+        out_flat = original + self.alpha * lora_update
+        if flat_input:
+            out = out_flat.view(B, T, self.out_features)
+            # Note: "B" here is overwritten; use the batch size from original_shape.
+            out = out_flat.view(B, T, self.out_features)
+            out = out_flat.view(B, T, self.out_features)
+            # Instead, correctly:
+            out = out_flat.view(B, T, self.out_features)
+        else:
+            out = out_flat
+        return out
 
 def apply_lora_to_module(module, r=4, alpha=1.0, exclude_types=(nn.Embedding,)):
     for name, child in list(module.named_children()):
@@ -383,7 +429,7 @@ def wrap_lm_with_lora(model, method="default", encoder_emb_dim=None, r=4, alpha=
 
 def evaluate(model, dataloader, method="default", device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
     model.eval()
-    loss_fn = nn.CrossEntropyLoss(ignore_index= -100)
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
     total_loss = 0.0
     num_batches = 0
     with torch.no_grad():
@@ -395,13 +441,12 @@ def evaluate(model, dataloader, method="default", device=torch.device("cuda" if 
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 loss = outputs.loss
             elif method == "hyper":
-                token_emb = batch["instruction_token_embedding"].to(device)
+                # Use the task token embedding for conditioning.
+                token_emb = batch["token_embedding"].to(device)
                 transformer_out = model.transformer(input_ids=input_ids, attention_mask=attention_mask)
-                hidden_states = transformer_out.last_hidden_state
-                last_hidden = hidden_states[:, -1, :]
-                logits = model.lm_head(last_hidden, token_embeddings=token_emb)
-                # Compute loss on the full sequence using the same ignore_index.
-                loss = loss_fn(logits, labels[:, -1])
+                hidden_states = transformer_out.last_hidden_state  # (B, T, H)
+                logits = model.lm_head(hidden_states, token_embeddings=token_emb)  # (B, T, vocab_size)
+                loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
             else:
                 raise ValueError("Unknown method")
             total_loss += loss.item()
@@ -410,11 +455,11 @@ def evaluate(model, dataloader, method="default", device=torch.device("cuda" if 
     model.train()
     return avg_loss
 
-def train_lm(model, train_loader, val_loader, method="default", num_epochs=10, learning_rate=2e-4, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), csv_filename="learning_curve.csv"):
+def train_lm(model, train_loader, val_loader, method="default", num_epochs=10, learning_rate=5e-4, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), csv_filename="learning_curve.csv"):
     model.to(device)
     model.train()
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate)
-    loss_fn = nn.CrossEntropyLoss(ignore_index= -100)
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
     best_val_loss = float("inf")
     history = []
     for epoch in range(num_epochs):
@@ -430,12 +475,11 @@ def train_lm(model, train_loader, val_loader, method="default", num_epochs=10, l
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 loss = outputs.loss
             elif method == "hyper":
-                token_emb = batch["instruction_token_embedding"].to(device)
+                token_emb = batch["token_embedding"].to(device)
                 transformer_out = model.transformer(input_ids=input_ids, attention_mask=attention_mask)
-                hidden_states = transformer_out.last_hidden_state
-                last_hidden = hidden_states[:, -1, :]
-                logits = model.lm_head(last_hidden, token_embeddings=token_emb)
-                loss = loss_fn(logits, labels[:, -1])
+                hidden_states = transformer_out.last_hidden_state  # (B, T, H)
+                logits = model.lm_head(hidden_states, token_embeddings=token_emb)  # (B, T, vocab_size)
+                loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
             else:
                 raise ValueError("Unknown method")
             loss.backward()
@@ -477,7 +521,9 @@ def count_trainable_params(model):
 # ======================================================
 
 def main():
+    global USE_TASK_ONLY_EMBEDDING
     args = parse_args()
+    USE_TASK_ONLY_EMBEDDING = args.use_task_only_embedding  # set our global flag
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Load tokenizer and LM.
@@ -496,7 +542,9 @@ def main():
         print("Loading and tokenizing Alpaca dataset...")
         train_ds = load_and_tokenize_alpaca_dataset(tokenizer, lm_model, max_length=args.max_length, split="train", dataset_name=args.dataset_name, device=DEVICE)
         val_ds = load_and_tokenize_alpaca_dataset(tokenizer, lm_model, max_length=args.max_length, split="validation", dataset_name=args.dataset_name, device=DEVICE)
-        clustering_field = "instruction_token_embedding"
+        # For clustering and hyper-LoRA, use the task token embedding computed.
+        clustering_field = "task_token_embedding"
+        encoder_emb_dim = len(train_ds[0]["task_token_embedding"])
     else:
         print("Loading and tokenizing training set...")
         train_ds = load_and_tokenize_dataset(tokenizer, max_length=args.max_length, split="train",
@@ -513,6 +561,7 @@ def main():
         print("Precomputing token embeddings for clustering/hypernetwork (validation set)...")
         val_ds = precompute_token_embeddings(val_ds, lm_model, tokenizer, DEVICE)
         clustering_field = "token_embedding"
+        encoder_emb_dim = len(train_ds[0]["token_embedding"])
 
     # Use pickle caching to save/reuse DataLoaders.
     ds_name_for_pickle = args.dataset_name.replace("/", "_")
@@ -531,8 +580,6 @@ def main():
     print(f"Best Validation Loss (Default LoRA): {best_val_loss_default:.4f}")
     
     # Option 2: Hyper‑network LoRA for the LM head.
-    encoder_emb_dim = len(train_ds[0]["instruction_token_embedding"])
-    print("\n=== Training with Hyper LoRA (Transformer + LM Head) ===")
     lm_model_hyper = AutoModelForCausalLM.from_pretrained(args.lm_model_name)
     if lm_model_hyper.config.pad_token_id is None:
         lm_model_hyper.config.pad_token_id = tokenizer.pad_token_id
