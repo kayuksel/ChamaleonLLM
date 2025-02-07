@@ -46,8 +46,8 @@ def parse_args():
                         help="Batch size (default: 16)")
     parser.add_argument("--max_length", type=int, default=512,
                         help="Maximum sequence length for tokenization (default: 512)")
-    parser.add_argument("--num_epochs", type=int, default=5,
-                        help="Number of training epochs (default: 5)")
+    parser.add_argument("--num_epochs", type=int, default=10,
+                        help="Number of training epochs (default: 10)")
     parser.add_argument("--rank", type=int, default=4,
                         help="LoRA rank (default: 4)")
     parser.add_argument("--alpha", type=float, default=1.0,
