@@ -44,8 +44,8 @@ def parse_args():
     parser.add_argument("--lm_model_name", type=str, default="gpt2",
                         help="Name of the causal LM from HF (default: 'gpt2')")
     # Use the Hugging Face name for the Alpaca dataset.
-    parser.add_argument("--dataset_name", type=str, default="tatsu-lab/alpaca",
-                        help="Dataset name on Hugging Face (default: 'tatsu-lab/alpaca')")
+    parser.add_argument("--dataset_name", type=str, default="yahma/alpaca-cleaned",
+                        help="Dataset name on Hugging Face (default: 'yahma/alpaca-cleaned')")
     parser.add_argument("--dataset_config", type=str, default=None,
                         help="Dataset configuration if any (default: None)")
     parser.add_argument("--text_field", type=str, default="text",
