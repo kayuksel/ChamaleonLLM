@@ -255,6 +255,20 @@ class LoRALinearHyper(nn.Module):
             nn.Dropout(0.5),
             nn.Linear(32, self.num_params)
         )
+
+        # Initialize earlier layers (all except the final one) using standard Xavier initialization.
+        for layer in list(self.hyper_net.children())[:-1]:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+        
+        # Initialize the final layer with small non‑zero values so that the hyper‑network
+        # outputs are near zero but still allow for gradient flow.
+        final_layer = self.hyper_net[-1]
+        nn.init.normal_(final_layer.weight, mean=0.0, std=1e-3)
+        if final_layer.bias is not None:
+            nn.init.normal_(final_layer.bias, mean=0.0, std=1e-3)
         
     def forward(self, x, token_embeddings):
         # Use the mean of token embeddings as input to the hyper‑network.
