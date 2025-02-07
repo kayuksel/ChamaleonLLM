@@ -134,78 +134,23 @@ def precompute_token_embeddings(dataset, lm_model, tokenizer, device):
 # 4. Clustering and DataLoader
 # ======================================================
 
-def kmeans_plus_plus_init(embeddings, k, similarity_metric="cosine"):
+def kmeans_clustering(embeddings, k, num_iters=10):
     """
-    K-Means++ Initialization for better centroid selection.
-    
-    Args:
-        embeddings (torch.Tensor): (N, D) token embeddings.
-        k (int): Number of clusters.
-        similarity_metric (str): "cosine" or "euclidean" for distance calculation.
-    
-    Returns:
-        torch.Tensor: (k, D) initialized cluster centroids.
+    A simple k-means clustering implementation using Euclidean distance.
+    (Embeddings are assumed to be normalized.)
+    embeddings: (N, D) torch.Tensor.
+    Returns: assignments (tensor of shape (N,))
     """
     N, D = embeddings.shape
-    centroids = torch.empty((k, D), dtype=torch.float, device=embeddings.device)
-    first_idx = torch.randint(0, N, (1,))
-    centroids[0] = embeddings[first_idx]
-
-    for j in range(1, k):
-        if similarity_metric == "cosine":
-            dists = 1 - torch.mm(embeddings, centroids[:j].T)  # Cosine distance: 1 - cosine_similarity
-        else:  # Euclidean
-            dists = torch.cdist(embeddings, centroids[:j], p=2).min(dim=1)[0] ** 2  # Squared L2 distance
-
-        prob = dists / dists.sum()
-        new_idx = torch.multinomial(prob, 1)
-        centroids[j] = embeddings[new_idx]
-
-    return centroids
-
-def kmeans_clustering(embeddings, k, num_iters=20, tol=1e-4, similarity_metric="cosine"):
-    """
-    K-Means Clustering with configurable similarity metric, K-Means++ initialization, and Early Stopping.
-
-    Args:
-        embeddings (torch.Tensor): (N, D) token embeddings.
-        k (int): Number of clusters.
-        num_iters (int): Maximum iterations.
-        tol (float): Threshold for early stopping.
-        similarity_metric (str): "cosine" or "euclidean" for distance calculation.
-
-    Returns:
-        torch.Tensor: Cluster assignments (N,)
-    """
-    if similarity_metric == "cosine":
-        embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)  # Normalize embeddings
-    centroids = kmeans_plus_plus_init(embeddings, k, similarity_metric)
-    prev_centroids = torch.zeros_like(centroids)
-
-    for i in range(num_iters):
-        if similarity_metric == "cosine":
-            dists = 1 - torch.mm(embeddings, centroids.T)  # Cosine distance: 1 - cos_sim
-        else:  # Euclidean
-            dists = torch.cdist(embeddings, centroids, p=2)  # L2 (Euclidean) distance
-
+    indices = torch.randperm(N)[:k]
+    centroids = embeddings[indices].clone()
+    for _ in range(num_iters):
+        dists = torch.cdist(embeddings, centroids, p=2) ** 2
         assignments = torch.argmin(dists, dim=1)
-
-        new_centroids = torch.stack([
-            embeddings[assignments == j].mean(dim=0) if (assignments == j).sum() > 0 else centroids[j]
-            for j in range(k)
-        ])
-
-        # Early stopping
-        centroid_shift = torch.norm(new_centroids - prev_centroids, p=2)
-        if centroid_shift < tol:
-            print(f"Early stopping at iteration {i+1} (centroid shift = {centroid_shift:.6f})")
-            break
-
-        prev_centroids = new_centroids
-        centroids = new_centroids
-
+        for j in range(k):
+            if (assignments == j).sum() > 0:
+                centroids[j] = embeddings[assignments == j].mean(dim=0)
     return assignments
-
 
 def create_clustered_dataloader(dataset, batch_size, clustering_field="token_embedding"):
     """
@@ -471,7 +416,6 @@ def train_lm(model, train_loader, val_loader, num_epochs=5, learning_rate=5e-4,
             target = labels[:, -1]
             loss = loss_fn(logits, target)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, model.parameters()), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item()
             num_batches += 1
