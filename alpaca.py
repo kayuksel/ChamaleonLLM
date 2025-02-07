@@ -46,14 +46,14 @@ def parse_args():
                         help="Batch size (default: 16)")
     parser.add_argument("--max_length", type=int, default=512,
                         help="Maximum sequence length for tokenization (default: 512)")
-    parser.add_argument("--num_epochs", type=int, default=10,
-                        help="Number of training epochs (default: 10)")
+    parser.add_argument("--num_epochs", type=int, default=5,
+                        help="Number of training epochs (default: 5)")
     parser.add_argument("--rank", type=int, default=4,
                         help="LoRA rank (default: 4)")
     parser.add_argument("--alpha", type=float, default=1.0,
                         help="Scaling factor for LoRA (default: 1.0)")
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="Learning rate for LoRA (default: 1e-4)")
+    parser.add_argument("--lr", type=float, default=2e-4,
+                        help="Learning rate for LoRA (default: 2e-4)")
     # Single experiments argument: comma separated list.
     parser.add_argument("--experiments", type=str, default="unadapted,default,hyper_task,hyper_taskinput",
                         help="Comma-separated list of experiments to run. Options: unadapted, default, hyper_task, hyper_taskinput")
@@ -411,7 +411,7 @@ def evaluate(model, dataloader, method="default", device=torch.device("cuda" if 
     model.train()
     return avg_loss
 
-def train_lm(model, train_loader, val_loader, method="default", num_epochs=10, learning_rate=1e-4, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), csv_filename="learning_curve.csv", hyper_embedding_field=None):
+def train_lm(model, train_loader, val_loader, method="default", num_epochs=10, learning_rate=2e-4, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), csv_filename="learning_curve.csv", hyper_embedding_field=None):
     model.to(device)
     model.train()
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate)
@@ -490,7 +490,7 @@ def compute_generation_metrics(model, dataset, tokenizer, device, max_new_tokens
         prompt = format_alpaca_prompt_for_generation(example)
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
-            generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+            generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id)
         input_length = inputs["input_ids"].shape[1]
         generated_ids = generated_ids[0][input_length:]
         generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
