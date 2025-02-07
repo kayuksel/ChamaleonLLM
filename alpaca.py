@@ -14,7 +14,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 from tqdm import tqdm
 
-import evaluate
+import evaluate as hf_evaluate
 
 # ======================================================
 # Global Dataset Wrapper for Pickling
@@ -496,9 +496,9 @@ def compute_generation_metrics(model, dataset, tokenizer, device, max_new_tokens
         generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         predictions.append(generated_text)
         references.append(example["output"].strip())
-    bleu_metric = evaluate.load("bleu")
-    meteor_metric = evaluate.load("meteor")
-    rouge_metric = evaluate.load("rouge")
+    bleu_metric = hf_evaluate.load("bleu")
+    meteor_metric = hf_evaluate.load("meteor")
+    rouge_metric = hf_evaluate.load("rouge")
     bleu_result = bleu_metric.compute(predictions=predictions, references=[[ref] for ref in references])
     meteor_result = meteor_metric.compute(predictions=predictions, references=references)
     rouge_result = rouge_metric.compute(predictions=predictions, references=references)
