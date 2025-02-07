@@ -14,6 +14,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 from tqdm import tqdm
 
+import evaluate
+
 # ----------------------------------------------------
 # Global flag that will be set from the command-line.
 # Controls whether the task embedding is computed from instruction only
@@ -167,7 +169,7 @@ def tokenize_and_compute_embeddings(example, tokenizer, lm_model, max_length, de
 
     return encoding
 
-def load_and_tokenize_alpaca_dataset(tokenizer, lm_model, max_length, split="train", dataset_name="tatsu-lab/alpaca", device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
+def load_and_tokenize_alpaca_dataset(tokenizer, lm_model, max_length, split="train", dataset_name="yahma/alpaca-cleaned", device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
     """
     Loads the Alpaca dataset and tokenizes each example.
     Since the Alpaca dataset only provides a 'train' split,
@@ -357,7 +359,7 @@ class LoRALinearHyper(nn.Module):
             nn.Linear(32, self.num_params)
         )
         
-    def forward(self, x, token_embeddings):
+    def forward(self, x, token_embeddings=None):
         # x can be of shape (B, H) or (B, T, H)
         original_shape = x.shape
         if len(original_shape) == 3:
@@ -367,8 +369,12 @@ class LoRALinearHyper(nn.Module):
         else:
             x_flat = x
             flat_input = False
-        # Compute parameters from the task token embedding.
-        # (Assume token_embeddings is of shape (B, D); we take the mean over batch.)
+        # For generation, if no token_embeddings are provided, fallback to default.
+        if token_embeddings is None:
+            if len(original_shape) == 3:
+                token_embeddings = x.mean(dim=1)  # (B, H)
+            else:
+                token_embeddings = x
         mean_encoder = token_embeddings.mean(dim=0, keepdim=True)  # shape: (1, D)
         pred = self.hyper_net(mean_encoder).squeeze(0)  # shape: (num_params,)
         A_flat = pred[: self.r * self.in_features]
@@ -380,12 +386,7 @@ class LoRALinearHyper(nn.Module):
         lora_update = F.linear(lora_update, B)
         out_flat = original + self.alpha * lora_update
         if flat_input:
-            out = out_flat.view(B, T, self.out_features)
-            # Note: "B" here is overwritten; use the batch size from original_shape.
-            out = out_flat.view(B, T, self.out_features)
-            out = out_flat.view(B, T, self.out_features)
-            # Instead, correctly:
-            out = out_flat.view(B, T, self.out_features)
+            out = out_flat.view(original_shape[0], original_shape[1], self.out_features)
         else:
             out = out_flat
         return out
@@ -517,7 +518,53 @@ def count_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 # ======================================================
-# 8. Main: Putting Everything Together
+# 8. Generation and Metric Evaluation Functions
+# ======================================================
+
+def format_alpaca_prompt_for_generation(example):
+    """
+    For generation, we want a prompt that ends at "### Response:" so that the model
+    will generate the answer. (We assume the example still contains the original fields.)
+    """
+    instruction = example["instruction"]
+    input_text = example.get("input", "").strip()
+    if input_text:
+        prompt = f"### Instruction:\n{instruction}\n### Input:\n{input_text}\n### Response:\n"
+    else:
+        prompt = f"### Instruction:\n{instruction}\n### Response:\n"
+    return prompt
+
+def compute_generation_metrics(model, dataset, tokenizer, device, max_new_tokens=100):
+    """
+    For each example in the validation dataset, generate a response from the model,
+    then compute BLEU, METEOR, and ROUGE scores (using the Hugging Face evaluate package)
+    comparing the generated response with the reference output.
+    """
+    model.eval()
+    predictions = []
+    references = []
+    for example in tqdm(dataset, desc="Generating predictions"):
+        prompt = format_alpaca_prompt_for_generation(example)
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        with torch.no_grad():
+            generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        # Remove the prompt tokens from the generated output.
+        input_length = inputs["input_ids"].shape[1]
+        generated_ids = generated_ids[0][input_length:]
+        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        predictions.append(generated_text)
+        references.append(example["output"].strip())
+    # Load the metrics from the evaluate package.
+    bleu_metric = evaluate.load("bleu")
+    meteor_metric = evaluate.load("meteor")
+    rouge_metric = evaluate.load("rouge")
+    bleu_result = bleu_metric.compute(predictions=predictions, references=[[ref] for ref in references])
+    meteor_result = meteor_metric.compute(predictions=predictions, references=references)
+    rouge_result = rouge_metric.compute(predictions=predictions, references=references)
+    return bleu_result, meteor_result, rouge_result
+
+# ======================================================
+# 9. Main: Putting Everything Together
 # ======================================================
 
 def main():
@@ -580,6 +627,7 @@ def main():
     print(f"Best Validation Loss (Default LoRA): {best_val_loss_default:.4f}")
     
     # Option 2: Hyper‑network LoRA for the LM head.
+    print("\n=== Training with Hyper LoRA (LM Head Hyper-Network) ===")
     lm_model_hyper = AutoModelForCausalLM.from_pretrained(args.lm_model_name)
     if lm_model_hyper.config.pad_token_id is None:
         lm_model_hyper.config.pad_token_id = tokenizer.pad_token_id
@@ -611,6 +659,30 @@ def main():
     orig_val_loss_train = evaluate(orig_model, train_loader, method="default", device=DEVICE)
     orig_val_perplexity_train = math.exp(orig_val_loss_train) if orig_val_loss_train < 20 else float("inf")
     print(f"Original LM Train Loss: {orig_val_loss_train:.4f} | Train Perplexity: {orig_val_perplexity_train:.4f}")
+
+    # Generate responses on validation and compute generation metrics for the unadapted LM.
+    print("\n=== Generating and Evaluating Metrics for Unadapted LM ===")
+    bleu_orig, meteor_orig, rouge_orig = compute_generation_metrics(orig_model, val_ds, tokenizer, DEVICE, max_new_tokens=100)
+    print("Unadapted LM Generation Metrics:")
+    print("BLEU:", bleu_orig)
+    print("METEOR:", meteor_orig)
+    print("ROUGE:", rouge_orig)
+
+    # Generate responses on validation and compute generation metrics for Default LoRA.
+    print("\n=== Generating and Evaluating Metrics for Default LoRA Model ===")
+    bleu_default_gen, meteor_default_gen, rouge_default_gen = compute_generation_metrics(model_default, val_ds, tokenizer, DEVICE, max_new_tokens=100)
+    print("Default LoRA Generation Metrics:")
+    print("BLEU:", bleu_default_gen)
+    print("METEOR:", meteor_default_gen)
+    print("ROUGE:", rouge_default_gen)
+
+    # Generate responses on validation and compute generation metrics for Hyper LoRA.
+    print("\n=== Generating and Evaluating Metrics for Hyper LoRA Model ===")
+    bleu_hyper_gen, meteor_hyper_gen, rouge_hyper_gen = compute_generation_metrics(model_hyper, val_ds, tokenizer, DEVICE, max_new_tokens=100)
+    print("Hyper LoRA Generation Metrics:")
+    print("BLEU:", bleu_hyper_gen)
+    print("METEOR:", meteor_hyper_gen)
+    print("ROUGE:", rouge_hyper_gen)
 
 if __name__ == "__main__":
     main()
