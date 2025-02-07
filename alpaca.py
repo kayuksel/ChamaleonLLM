@@ -519,6 +519,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     print("Loading pre-trained LM...")
     lm_model = AutoModelForCausalLM.from_pretrained(args.lm_model_name)
+    lm_model.config.pad_token_id = tokenizer.pad_token_id
     total_params = sum(p.numel() for p in lm_model.parameters())
     print(f"Total parameters in unadapted LM: {total_params}")
 
