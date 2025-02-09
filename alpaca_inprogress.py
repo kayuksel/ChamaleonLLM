@@ -57,6 +57,8 @@ def parse_args():
     # Single experiments argument: comma separated list.
     parser.add_argument("--experiments", type=str, default="unadapted,default,hyper_task,hyper_taskinput",
                         help="Comma-separated list of experiments to run. Options: unadapted, default, hyper_task, hyper_taskinput")
+    parser.add_argument("--loss_mode", type=str, default="last", choices=["last", "full"],
+                        help="Loss mode: 'last' to compute loss using only the last token (default) or 'full' to compute loss over the full sequence.")
     args = parser.parse_args()
     return args
 
@@ -298,7 +300,7 @@ class LoRALinearDefault(nn.Module):
             self.bias = None
         self.A = nn.Parameter(torch.randn(r, self.in_features) * 0.01)
         self.B = nn.Parameter(torch.randn(self.out_features, r) * 0.01)
-    def forward(self, x):
+    def forward(self, x, token_embeddings=None):
         original = F.linear(x, self.weight, self.bias)
         lora_update = F.linear(x, self.A)
         lora_update = F.linear(lora_update, self.B)
@@ -326,21 +328,6 @@ class LoRALinearHyper(nn.Module):
             nn.Dropout(0.5),
             nn.Linear(32, self.num_params)
         )
-
-        # Initialize earlier layers (all except the final one) using standard Xavier initialization.
-        for layer in list(self.hyper_net.children())[:-1]:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
-        
-        # Initialize the final layer with small non‑zero values so that the hyper‑network
-        # outputs are near zero but still allow for gradient flow.
-        final_layer = self.hyper_net[-1]
-        nn.init.normal_(final_layer.weight, mean=0.0, std=1e-3)
-        if final_layer.bias is not None:
-            nn.init.normal_(final_layer.bias, mean=0.0, std=1e-3)
-            
     def forward(self, x, token_embeddings=None):
         original_shape = x.shape
         if len(original_shape) == 3:
@@ -397,11 +384,56 @@ def wrap_lm_with_lora(model, method="default", encoder_emb_dim=None, r=4, alpha=
     return model
 
 # ======================================================
-# 6. Training and Evaluation Functions
+# 6. Loss Function to Choose Between Last Token or Full Sequence Loss
 # ======================================================
-def evaluate(model, dataloader, method="default", device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), hyper_embedding_field=None):
+def compute_loss(model, input_ids, attention_mask, labels, token_embedding=None, loss_mode="last"):
+    """
+    Compute the cross-entropy loss for the model in one of two modes:
+      - "last": computes the loss using only the prediction from the last token.
+      - "full": computes the loss over the entire sequence (by shifting logits and labels)
+                and normalizing by the number of non-padding tokens.
+    """
+    transformer_out = model.transformer(input_ids=input_ids, attention_mask=attention_mask)
+    hidden_states = transformer_out.last_hidden_state  # [batch, seq_len, hidden_dim]
+
+    if loss_mode == "last":
+        # Use only the last token's hidden state.
+        last_hidden = hidden_states[:, -1, :]  # [batch, hidden_dim]
+        if token_embedding is not None:
+            logits = model.lm_head(last_hidden, token_embeddings=token_embedding)
+        else:
+            logits = model.lm_head(last_hidden)
+        target = labels[:, -1]
+        loss_fn = nn.CrossEntropyLoss(ignore_index=0)
+        loss = loss_fn(logits, target)
+        return loss
+
+    elif loss_mode == "full":
+        # Compute logits over the full sequence.
+        if token_embedding is not None:
+            logits = model.lm_head(hidden_states, token_embeddings=token_embedding)
+        else:
+            logits = model.lm_head(hidden_states)
+        # Shift logits and labels so that each prediction corresponds to the next token.
+        shift_logits = logits[:, :-1, :].contiguous()  # [batch, seq_len-1, vocab_size]
+        shift_labels = labels[:, 1:].contiguous()         # [batch, seq_len-1]
+        
+        # Use a summed loss and normalize by the number of non-padding tokens.
+        loss_fn = nn.CrossEntropyLoss(ignore_index=0, reduction="sum")
+        loss_sum = loss_fn(shift_logits.view(-1, shift_logits.size(-1)),
+                           shift_labels.view(-1))
+        non_pad_tokens = (shift_labels != 0).sum().item()
+        loss = loss_sum / non_pad_tokens if non_pad_tokens > 0 else loss_sum
+        return loss
+
+    else:
+        raise ValueError("Invalid loss_mode. Choose either 'last' or 'full'.")
+
+# ======================================================
+# 7. Training and Evaluation Functions
+# ======================================================
+def evaluate(model, dataloader, method="default", device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), hyper_embedding_field=None, loss_mode="last"):
     model.eval()
-    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
     total_loss = 0.0
     num_batches = 0
     with torch.no_grad():
@@ -410,27 +442,20 @@ def evaluate(model, dataloader, method="default", device=torch.device("cuda" if 
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             if method == "default":
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss
+                token_embedding = None
             elif method == "hyper":
-                token_emb = batch[hyper_embedding_field].to(device) if hyper_embedding_field else batch["hyper_task_token_embedding_taskinput"].to(device)
-                transformer_out = model.transformer(input_ids=input_ids, attention_mask=attention_mask)
-                hidden_states = transformer_out.last_hidden_state
-                logits = model.lm_head(hidden_states, token_embeddings=token_emb)
-                loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
-            else:
-                raise ValueError("Unknown method")
+                token_embedding = batch[hyper_embedding_field].to(device) if hyper_embedding_field else batch["hyper_task_token_embedding_taskinput"].to(device)
+            loss = compute_loss(model, input_ids, attention_mask, labels, token_embedding=token_embedding, loss_mode=loss_mode)
             total_loss += loss.item()
             num_batches += 1
     avg_loss = total_loss / num_batches if num_batches > 0 else float("inf")
     model.train()
     return avg_loss
 
-def train_lm(model, train_loader, val_loader, method="default", num_epochs=10, learning_rate=2e-4, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), csv_filename="learning_curve.csv", hyper_embedding_field=None):
+def train_lm(model, train_loader, val_loader, method="default", num_epochs=10, learning_rate=2e-4, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), csv_filename="learning_curve.csv", hyper_embedding_field=None, loss_mode="last"):
     model.to(device)
     model.train()
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate)
-    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
     best_val_loss = float("inf")
     history = []
     for epoch in range(num_epochs):
@@ -441,25 +466,19 @@ def train_lm(model, train_loader, val_loader, method="default", num_epochs=10, l
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            optimizer.zero_grad()
             if method == "default":
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss
+                token_embedding = None
             elif method == "hyper":
-                token_emb = batch[hyper_embedding_field].to(device) if hyper_embedding_field else batch["hyper_task_token_embedding_taskinput"].to(device)
-                transformer_out = model.transformer(input_ids=input_ids, attention_mask=attention_mask)
-                hidden_states = transformer_out.last_hidden_state
-                logits = model.lm_head(hidden_states, token_embeddings=token_emb)
-                loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
-            else:
-                raise ValueError("Unknown method")
+                token_embedding = batch[hyper_embedding_field].to(device) if hyper_embedding_field else batch["hyper_task_token_embedding_taskinput"].to(device)
+            optimizer.zero_grad()
+            loss = compute_loss(model, input_ids, attention_mask, labels, token_embedding=token_embedding, loss_mode=loss_mode)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
             num_batches += 1
             progress.set_postfix(loss=total_loss/num_batches)
         avg_train_loss = total_loss / num_batches if num_batches > 0 else float("inf")
-        val_loss = evaluate(model, val_loader, method=method, device=device, hyper_embedding_field=hyper_embedding_field)
+        val_loss = evaluate(model, val_loader, method=method, device=device, hyper_embedding_field=hyper_embedding_field, loss_mode=loss_mode)
         val_perplexity = math.exp(val_loss) if val_loss < 20 else float("inf")
         print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f} | Val Loss = {val_loss:.4f} | Val Perplexity = {val_perplexity:.4f}")
         history.append({
@@ -480,13 +499,13 @@ def train_lm(model, train_loader, val_loader, method="default", num_epochs=10, l
     return best_val_loss, history
 
 # ======================================================
-# 7. Utility to Count Trainable Parameters
+# 8. Utility to Count Trainable Parameters
 # ======================================================
 def count_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 # ======================================================
-# 8. Generation and Metric Evaluation Functions
+# 9. Generation and Metric Evaluation Functions
 # ======================================================
 def format_alpaca_prompt_for_generation(example):
     instruction = example["instruction"]
@@ -520,7 +539,7 @@ def compute_generation_metrics(model, dataset, tokenizer, device, max_new_tokens
     return bleu_result, meteor_result, rouge_result
 
 # ======================================================
-# 9. Main: Putting Everything Together
+# 10. Main: Putting Everything Together
 # ======================================================
 def main():
     args = parse_args()
@@ -569,13 +588,12 @@ def main():
 
     # --------------------------
     # Run experiments as specified.
-    # --------------------------
     # 1. Unadapted GPT-2.
     if "unadapted" in experiments:
         print("\n=== Running Unadapted GPT-2 Experiment ===")
         unadapted_model = AutoModelForCausalLM.from_pretrained(args.lm_model_name)
         unadapted_model.to(DEVICE)
-        val_loss = evaluate(unadapted_model, val_loader, method="default", device=DEVICE)
+        val_loss = evaluate(unadapted_model, val_loader, method="default", device=DEVICE, loss_mode=args.loss_mode)
         val_perplexity = math.exp(val_loss) if val_loss < 20 else float("inf")
         print(f"Unadapted GPT-2: Val Loss = {val_loss:.4f} | Val Perplexity = {val_perplexity:.4f}")
         bleu, meteor, rouge = compute_generation_metrics(unadapted_model, val_ds, tokenizer, DEVICE, max_new_tokens=100)
@@ -592,7 +610,7 @@ def main():
         best_val_loss_default, _ = train_lm(
             model_default, train_loader, val_loader, method="default",
             num_epochs=args.num_epochs, learning_rate=args.lr, device=DEVICE,
-            csv_filename="learning_curve_default.csv"
+            csv_filename="learning_curve_default.csv", loss_mode=args.loss_mode
         )
         print(f"Default LoRA: Best Validation Loss = {best_val_loss_default:.4f}")
         bleu, meteor, rouge = compute_generation_metrics(model_default, val_ds, tokenizer, DEVICE, max_new_tokens=100)
@@ -625,7 +643,8 @@ def main():
             model_hyper, train_loader, val_loader, method="hyper",
             num_epochs=args.num_epochs, learning_rate=args.lr, device=DEVICE,
             csv_filename=f"learning_curve_hyper_{mode}.csv",
-            hyper_embedding_field=f"hyper_task_token_embedding_{mode}"
+            hyper_embedding_field=f"hyper_task_token_embedding_{mode}",
+            loss_mode=args.loss_mode
         )
         print(f"Hyper LoRA ({mode}): Best Validation Loss = {best_val_loss:.4f}")
         hyper_models[mode] = model_hyper
